@@ -1,40 +1,16 @@
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback } from 'react';
 import SearchBar from './components/SearchBar.jsx';
 import PipelineProgress from './components/PipelineProgress.jsx';
 import EntityTable from './components/EntityTable.jsx';
 import ExportButtons from './components/ExportButtons.jsx';
-import { runAgenticSearch } from './lib/agent.js';
 import './App.css';
 
 export default function App() {
-  const [apiKey, setApiKey] = useState(() => sessionStorage.getItem('anthropic_key') || '');
-  const [keyReady, setKeyReady] = useState(() => !!sessionStorage.getItem('anthropic_key'));
-  const [serperKey, setSerperKey] = useState(() => sessionStorage.getItem('serper_key') || '');
   const [location, setLocation] = useState(() => sessionStorage.getItem('user_location') || '');
   const [steps, setSteps] = useState([]);
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
   const [running, setRunning] = useState(false);
-
-  const saveKey = () => {
-    const k = apiKey.trim();
-    if (k) {
-      sessionStorage.setItem('anthropic_key', k);
-      setKeyReady(true);
-    }
-  };
-
-  const clearKey = () => {
-    sessionStorage.removeItem('anthropic_key');
-    setApiKey('');
-    setKeyReady(false);
-  };
-
-  const saveSerperKey = (val) => {
-    setSerperKey(val);
-    if (val.trim()) sessionStorage.setItem('serper_key', val.trim());
-    else sessionStorage.removeItem('serper_key');
-  };
 
   const saveLocation = (val) => {
     setLocation(val);
@@ -43,39 +19,69 @@ export default function App() {
   };
 
   const handleSearch = useCallback(async (query) => {
-    const key = sessionStorage.getItem('anthropic_key') || apiKey.trim();
-    if (!key) {
-      setError('Please enter your Anthropic API key above.');
-      return;
-    }
-
     setSteps([]);
     setResult(null);
     setError(null);
     setRunning(true);
 
     try {
-      const data = await runAgenticSearch(query, {
-        apiKey: key,
-        serperKey: serperKey.trim() || undefined,
-        location: location.trim() || undefined,
-        onStep: (step) => setSteps(prev => {
-          const idx = prev.findIndex(s => s.id === step.id);
-          if (idx >= 0) {
-            const next = [...prev];
-            next[idx] = step;
-            return next;
-          }
-          return [...prev, step];
-        }),
+      const res = await fetch('/api/search', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query, location: location.trim() || undefined }),
       });
-      setResult(data);
+
+      if (!res.ok && !res.headers.get('content-type')?.includes('text/event-stream')) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || `Server error ${res.status}`);
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        const parts = buffer.split('\n\n');
+        buffer = parts.pop() || '';
+
+        for (const part of parts) {
+          const lines = part.split('\n');
+          let event = '', data = '';
+          for (const line of lines) {
+            if (line.startsWith('event: ')) event = line.slice(7);
+            else if (line.startsWith('data: ')) data = line.slice(6);
+          }
+          if (!event || !data) continue;
+
+          const parsed = JSON.parse(data);
+
+          if (event === 'step') {
+            setSteps(prev => {
+              const idx = prev.findIndex(s => s.id === parsed.id);
+              if (idx >= 0) {
+                const next = [...prev];
+                next[idx] = parsed;
+                return next;
+              }
+              return [...prev, parsed];
+            });
+          } else if (event === 'result') {
+            setResult(parsed);
+          } else if (event === 'error') {
+            throw new Error(parsed.message);
+          }
+        }
+      }
     } catch (err) {
       setError(err.message || String(err));
     } finally {
       setRunning(false);
     }
-  }, [apiKey, serperKey, location]);
+  }, [location]);
 
   return (
     <div className="app">
@@ -85,41 +91,6 @@ export default function App() {
       </header>
 
       <main className="main">
-        <div className="key-card">
-          <span className="key-card-label">API Key</span>
-          <div className="key-input-wrap">
-            <input
-              className="key-input"
-              type="password"
-              placeholder="sk-ant-api..."
-              value={apiKey}
-              onChange={e => setApiKey(e.target.value)}
-              onKeyDown={e => e.key === 'Enter' && saveKey()}
-            />
-            <button className="key-btn" onClick={saveKey}>Save</button>
-            <button className="key-btn" onClick={clearKey}>Clear</button>
-          </div>
-          <span className={`key-status ${keyReady ? '' : 'missing'}`}>
-            {keyReady ? '✓ ready' : '⚠ not set'}
-          </span>
-        </div>
-
-        <div className="key-card">
-          <span className="key-card-label">Serper</span>
-          <div className="key-input-wrap">
-            <input
-              className="key-input"
-              type="password"
-              placeholder="serper.dev key (optional — faster search with location support)"
-              value={serperKey}
-              onChange={e => saveSerperKey(e.target.value)}
-            />
-          </div>
-          <span className={`key-status ${serperKey.trim() ? '' : 'missing'}`}>
-            {serperKey.trim() ? '✓ set' : 'optional'}
-          </span>
-        </div>
-
         <div className="key-card">
           <span className="key-card-label">Location</span>
           <div className="key-input-wrap">
