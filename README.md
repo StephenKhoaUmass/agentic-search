@@ -120,6 +120,13 @@ git push origin master
 
 Users visit the Vercel URL, enter a query, and results stream back in real time. Your API keys stay on the server.
 
+**If Deploy is greyed out or Vercel shows “Services”:** This repo has a `frontend/` folder and a `backend/` folder, so Vercel may auto-pick the **Services** preset and ask for `experimentalServices` in `vercel.json`. **Do not use that preset for this project.** The Express `backend/` is only for local development. Production uses the **Vite build** plus the **serverless** route `api/search.js` at the repo root.
+
+- Change **Framework / Application Preset** from **Services** to **Other** (or **Vite** if offered as a single app).
+- Leave **Root Directory** as `./` (repository root) so `api/search.js` is included.
+- Ensure `vercel.json` in the repo is picked up (it defines `buildCommand` and `outputDirectory`).
+- A `.vercelignore` file excludes `backend/` from deployment so Vercel is less likely to treat it as a second service.
+
 ---
 
 ## Approach & Design Decisions

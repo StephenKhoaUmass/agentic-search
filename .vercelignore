@@ -1,0 +1,3 @@
+# Local Express server only — not deployed to Vercel.
+# Vite app + /api/search serverless function live at repo root + frontend/.
+backend/
