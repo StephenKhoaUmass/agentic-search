@@ -1,198 +1,196 @@
 # Agentic Search — Entity Discovery Engine
 
-A multi-stage LLM agent pipeline that takes a natural language topic query and produces a structured, source-traceable table of discovered entities.
-
-> **Live demo:** Deployed on Vercel — API keys are stored server-side, users just enter a query.
->
-> **Local:** Run `cd frontend && npm run dev` (with backend) or open `standalone/index.html` (bring your own API keys).
-
----
-
-## What it does
+A multi-stage LLM agent pipeline that takes a natural-language topic query and produces a structured, source-traceable table of discovered entities.
 
 ```
 Query: "AI startups in healthcare"
   ↓
-[Stage 1] Schema Planner    → Generates domain-appropriate columns + 4 diverse search queries
-  ↓                            (location-aware: rewrites "near me" → actual location)
-[Stage 2] Web Search         → Discovers 15-20 web sources via Serper.dev (4 queries × 10 results)
-  ↓      + Places Reference  → Single Google Places call for authoritative entity data
-[Stage 3] Page Scraper       → Fetches page content as markdown via Jina Reader (no LLM)
+[1] Schema Planner   →  domain-appropriate columns + 4 diverse search queries
+[2] Web Search       →  Serper.dev (or Tavily MCP, planned) → ~15 sources + Google Places refs
+[3] Page Scraper     →  Jina Reader → markdown (no LLM)
+[4] Entity Extractor →  Claude @ temperature=0, strict qualifier matching, per-source records
+[5] Enricher         →  fuzzy merge → Places cross-walk → adaptive quality scoring → filter
   ↓
-[Stage 4] Entity Extractor   → LLM extracts per-source records (temperature=0 for consistency)
-  ↓                            strict qualifier filtering (e.g., "startups" excludes corporations)
-[Stage 5] Enricher           → Fuzzy merge → Places cross-reference → quality scoring → filter
-  ↓
-Table: { name, description, headquarters, funding_stage, total_funding, website, focus_area, ... }
-       each cell → traceable to source URL
+Table: { name, description, funding_stage, total_funding, headquarters, ... }   each cell ⇒ source URL
 ```
 
-Every cell value is attributable to a source URL. Confidence scores blend field completeness, quality signals (ratings, reviews, funding), and cross-source corroboration.
+A LangGraph quality-gate node after extraction can route back into search with reformulated queries (max 2 iterations) when fewer than 3 sources, fewer than 5 entities, or >60% low-confidence results come back.
+
+---
+
+## Prerequisites
+
+| Tool | Version | Notes |
+|---|---|---|
+| Node.js | ≥ 18 | for the Vite/React frontend |
+| Python | ≥ 3.11 | for the LangGraph/FastAPI backend |
+| `uvx` (or pip + venv) | — | recommended for managing the Python env. Install via `pip install uv` or `brew install uv` |
+
+You'll also need API keys for:
+- **Anthropic** (required) — used for the planner, extractor, and reformulator
+- **Serper.dev** (optional but strongly recommended) — `https://serper.dev`, free tier is 2,500 queries/month
+- **Tavily** (optional) — used via MCP when wired up; falls back to Serper today
+- **GitHub PAT** (optional) — used for star-count enrichment when running against open-source queries
+
+---
+
+## Local setup
+
+### 1. Backend (Python — FastAPI + LangGraph)
+
+```bash
+cd backend_py
+
+# Fill in API keys
+cp .env.example .env
+$EDITOR .env       # set ANTHROPIC_API_KEY (required) and SERPER_API_KEY (recommended)
+
+# Install dependencies (using uv — fastest)
+uv venv && source .venv/bin/activate
+uv pip install -r requirements.txt
+
+# OR with plain pip
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+# Run the dev server
+uvicorn app.main:app --reload --port 8000
+# → http://localhost:8000           (root info)
+# → http://localhost:8000/docs      (auto-generated OpenAPI UI)
+# → http://localhost:8000/health    (config probe — shows which keys are present)
+```
+
+Smoke-test from the shell:
+
+```bash
+curl -N -X POST http://localhost:8000/search \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"open source vector databases","location":null}'
+# → streams: event: step ... event: step ... event: result
+```
+
+### 2. Frontend (React + Vite)
+
+```bash
+cd frontend
+
+cp .env.example .env
+# .env contains only VITE_API_URL — points at the Python backend (default: http://localhost:8000)
+
+npm install
+npm run dev        # → http://localhost:5173
+```
+
+Open the browser, type a query (e.g. *"top pizza places near me"* with `Amherst, MA` in the Location field), and watch the pipeline stages stream in.
+
+> **Why no Vite proxy?** The frontend talks to the backend through an absolute URL (`VITE_API_URL`) and the backend has CORS enabled (`allow_origins=["*"]` by default). This works identically in local dev and in prod — only the env var changes. The proxy block is left commented in `frontend/vite.config.js` if you ever want to hide the backend URL behind a same-origin `/api/*` path during dev.
+
+---
+
+## Deployment
+
+### Frontend — Vercel
+
+```bash
+git push origin master
+# Then on vercel.com/new:
+#   - Framework preset: Other (or Vite if offered)
+#   - Root Directory:   ./
+#   - Environment variables (Vercel dashboard):
+#       VITE_API_URL = https://<your-backend>.up.railway.app
+```
+
+The Vite build produces a static SPA; there are no server-side routes on Vercel anymore (the legacy `api/search.js` is kept as a reference and is not exercised by the new App).
+
+### Backend — Railway (or Render)
+
+The Python backend is **not** deployable to Vercel — its LangGraph runner is a long-lived async process with sub-tasks per node, which Vercel's stateless 60-second Lambda runtime can't host cleanly. Railway and Render are both happy to run a FastAPI process with persistent workers; both have a free tier sufficient for a portfolio demo.
+
+**Railway:**
+
+```bash
+# From Railway dashboard:
+#   1. New Project → Deploy from GitHub repo
+#   2. Root Directory:  backend_py
+#   3. Start Command:   uvicorn app.main:app --host 0.0.0.0 --port $PORT
+#   4. Environment variables (Variables tab):
+#        ANTHROPIC_API_KEY = sk-ant-...           (required)
+#        SERPER_API_KEY    = ...                  (recommended)
+#        TAVILY_API_KEY    = ...                  (optional)
+#        GITHUB_PERSONAL_ACCESS_TOKEN = ...       (optional)
+#        ALLOWED_ORIGINS   = https://<your-frontend>.vercel.app
+#        CLAUDE_MODEL      = claude-sonnet-4-20250514   (optional override)
+#   5. Generate Domain → copy the *.up.railway.app URL
+```
+
+Then set `VITE_API_URL` to that URL in your Vercel project's environment variables and redeploy the frontend.
+
+> **Why Vercel won't work for the Python backend:** the request enters `/search`, opens an SSE stream, and the LangGraph runner emits events over a 15-60 second window while making sequential API calls to Anthropic + Serper + Jina. Vercel's serverless functions hit their 60s wall-clock limit and don't have first-class support for long-lived SSE keep-alives. Railway runs Python as a regular process behind a load balancer, so the SSE pipe stays open and the contextvar-based event queue (one per request) survives across all the node `await` points.
 
 ---
 
 ## Architecture
 
+The pipeline is built on **LangGraph** — each of the 5 stages above is one node in a typed `StateGraph[PipelineState]`. After extraction, an `evaluate_quality` node decides `pass | retry | fail` based on source count, entity count, and the fraction of low-confidence results; on `retry` a `reformulate_queries` node asks Claude for 4 fresh search queries (deduped against prior attempts) and the graph loops back to `search_web`. Retry budget is capped at 2 iterations total to bound latency and cost. **MCP** (Model Context Protocol) tool servers are integrated through Anthropic's beta MCP API: Tavily for web search (placeholder — Serper is the default backend today) and GitHub for star-count enrichment on open-source queries. Real-time pipeline progress reaches the React frontend via **Server-Sent Events** — the FastAPI `/search` endpoint creates a per-request `asyncio.Queue` bound through a `contextvars`-scoped helper so concurrent requests have isolated event streams, and `graph.astream()` yields control to the SSE writer after each node so the UI shows `running → done` transitions in real time rather than batched at the end.
+
+### Repo layout
+
 ```
 agentic-search/
-├── api/
-│   └── search.js               ← Vercel serverless function (API keys stay server-side)
-├── standalone/
-│   └── index.html              ← zero-dependency single-file version (user provides own keys)
-├── frontend/                   ← React + Vite SPA
-│   ├── .env.example            ← template for API keys (copy to .env)
-│   ├── index.html
-│   ├── vite.config.js
-│   ├── package.json
-│   └── src/
-│       ├── main.jsx
-│       ├── App.jsx             ← calls /api/search, renders pipeline progress + results
-│       ├── App.css
-│       ├── components/
-│       │   ├── SearchBar.jsx
-│       │   ├── PipelineProgress.jsx
-│       │   ├── EntityTable.jsx  (sortable, filterable, with source links)
-│       │   └── ExportButtons.jsx
-│       └── lib/
-│           └── agent.js        ← core 5-stage pipeline (used by api/ and backend/)
-├── backend/                    ← Optional Express server for local dev
+├── backend_py/                ← Python backend (LangGraph + FastAPI)  ★ primary
+│   ├── app/
+│   │   ├── main.py            ← FastAPI app, /search SSE endpoint, /health
+│   │   ├── config.py          ← env-loading + immutable Settings dataclass
+│   │   ├── graph/
+│   │   │   ├── builder.py     ← LangGraph wiring + conditional retry edges
+│   │   │   ├── state.py       ← PipelineState TypedDict
+│   │   │   └── nodes/         ← one async function per stage
+│   │   ├── lib/
+│   │   │   ├── claude.py      ← Anthropic async wrapper (per-call MCP support)
+│   │   │   ├── search_backends/  ← pluggable Serper / Tavily-MCP backends
+│   │   │   ├── places.py      ← Serper Places API + PLACES_COL_MAP cross-walk
+│   │   │   ├── jina.py        ← Jina Reader async fetch
+│   │   │   ├── fuzzy_merge.py ← name normalization + merge_entities
+│   │   │   └── scoring.py     ← classify_quality_columns + adaptive scoring
+│   │   └── streaming/events.py ← contextvar-bound per-request queue + SSE emitters
+│   ├── scripts/               ← verify_enrichment.py, verify_main_sse.py
 │   ├── .env.example
-│   ├── src/
-│   │   ├── server.js           ← Express + SSE streaming (reads keys from .env)
-│   │   └── lib/pipeline.js     ← re-exports frontend agent.js
-│   └── package.json
-├── vercel.json                 ← Vercel deployment config
-├── package.json                ← root ESM config
+│   └── requirements.txt
+├── frontend/                  ← React + Vite SPA (calls Python backend via VITE_API_URL)
+│   ├── src/App.jsx            ← fetch + ReadableStream SSE parser
+│   ├── src/components/        ← SearchBar, PipelineProgress, EntityTable, ExportButtons
+│   ├── src/lib/agent.js       ← legacy JS pipeline (kept as reference, unused by App)
+│   ├── vite.config.js
+│   └── .env.example
+├── api/search.js              ← legacy Vercel serverless function (kept as reference)
+├── standalone/index.html      ← legacy bring-your-own-keys single-file demo
+├── vercel.json
 └── README.md
 ```
 
-**Key security model:** API keys never reach the browser.
-- **Vercel deployment**: `api/search.js` reads keys from Vercel Environment Variables
-- **Local dev**: Express backend reads keys from `backend/.env`
-- **Standalone**: user provides their own keys (runs entirely in-browser)
+### Verification scripts
+
+Both live in `backend_py/scripts/`:
+
+- `verify_enrichment.py` — numeric verification of fuzzy merge, places cross-walk, and the three adaptive-scoring branches (`anyEntityHasQuality` reward, penalty, and fallback).
+- `verify_main_sse.py` — TestClient + stub-graph end-to-end: confirms the SSE wire format matches the frontend's `onStep` contract byte-for-byte, validates concurrent-request isolation, and exercises the pre-stream 422 branch.
+
+Run from `backend_py/`:
+
+```bash
+ANTHROPIC_API_KEY=test-stub python -m scripts.verify_enrichment
+ANTHROPIC_API_KEY=test-stub python -m scripts.verify_main_sse
+```
 
 ---
 
-## Quick Start
-
-### Option A — Standalone (zero dependencies, bring your own keys)
-
-```bash
-open standalone/index.html
-```
-
-Enter your Anthropic API key (and optionally Serper key) in the input fields. Keys are stored in `sessionStorage` (never sent to any server).
-
-### Option B — Local Dev (frontend + backend, keys hidden server-side)
-
-```bash
-# 1. Set up API keys
-cp backend/.env.example backend/.env
-# Edit backend/.env and add your keys
-
-# 2. Start backend (reads keys from .env)
-cd backend
-npm install
-npm start          # → http://localhost:3001
-
-# 3. In another terminal, start frontend
-cd frontend
-npm install
-npm run dev        # → http://localhost:5173 (proxies /api to backend)
-```
-
-### Option C — Deploy to Vercel (recommended for sharing)
-
-```bash
-# 1. Push to GitHub
-git push origin master
-
-# 2. Import repo on Vercel (vercel.com/new)
-#    - Set Root Directory to: (leave blank — uses vercel.json at root)
-#    - Vercel auto-detects the build config
-
-# 3. Add Environment Variables in Vercel dashboard:
-#    ANTHROPIC_API_KEY = sk-ant-...
-#    SERPER_API_KEY    = your-serper-key (optional)
-
-# 4. Deploy — done!
-```
-
-Users visit the Vercel URL, enter a query, and results stream back in real time. Your API keys stay on the server.
-
-**If Deploy is greyed out or Vercel shows “Services”:** This repo has a `frontend/` folder and a `backend/` folder, so Vercel may auto-pick the **Services** preset and ask for `experimentalServices` in `vercel.json`. **Do not use that preset for this project.** The Express `backend/` is only for local development. Production uses the **Vite build** plus the **serverless** route `api/search.js` at the repo root.
-
-- Change **Framework / Application Preset** from **Services** to **Other** (or **Vite** if offered as a single app).
-- Leave **Root Directory** as `./` (repository root) so `api/search.js` is included.
-- Ensure `vercel.json` in the repo is picked up (it defines `buildCommand` and `outputDirectory`).
-- A `.vercelignore` file excludes `backend/` from deployment so Vercel is less likely to treat it as a second service.
-
----
-
-## Approach & Design Decisions
-
-### Why a multi-stage pipeline?
-
-A naive "search and return results" approach yields generic, poorly-structured data. The key insight is that **different queries need different schemas**: pizza places need `cuisine, price_range, rating`; startups need `funding, stage, HQ, founded`.
-
-The pipeline solves this with a **Schema Planner** as Stage 1 — it dynamically designs the extraction schema before any content is fetched, so the extractor knows exactly what to look for.
-
-### Stage 1: Schema Planner (LLM)
-The planner LLM call receives the query (plus optional user location) and outputs:
-- `entity_type`: what kind of things we're finding
-- `columns`: typed column definitions (text, url, tags, number)
-- `search_queries`: 4 diverse queries targeting different source types (aggregator, structured data, niche, curated directory)
-- `extraction_prompt`: domain-tailored instructions for the extraction stage, including strict entity qualification rules
-
-If a user location is provided, "near me" and similar phrases are rewritten to include the actual location in search queries.
-
-### Stage 2: Web Search + Places Reference (Serper.dev or Claude fallback)
-**Web search**: If a Serper key is configured, uses Google search via Serper (~1-2s, native location support, 2,500 free queries). Runs 4 queries × 10 results each, deduplicates by URL, and returns up to 15 sources. Otherwise, falls back to Claude's built-in `web_search_20250305` tool (~15-30s).
-
-**Places reference**: After web search completes, a single Serper `/places` API call fetches authoritative Google Places data (rating, review count, address, phone, price level). This runs sequentially after web search to avoid rate limiting. For non-local queries (e.g., "open source database tools"), this step is a no-op.
-
-### Stage 3: Page Scraping (Jina Reader — no LLM)
-Uses [Jina Reader](https://r.jina.ai) to fetch and convert web pages to **structured markdown** in parallel. Each page is fetched concurrently with a 15-second timeout, preserving headings, tables, and lists that contain structured data.
-
-**Why markdown, not plain text?** Restaurant rating tables, software comparison lists, and company info boxes render as structured markdown that the LLM can parse. Plain text strips this structure.
-
-**Why not LLM scraping?** An earlier version used Claude for scraping, adding 40-60s and costing an extra inference call. Jina Reader completes in 3-8 seconds total with deterministic output.
-
-### Stage 4: Entity Extraction (LLM, temperature=0)
-A dedicated extraction call at `temperature=0` (for deterministic output) receives the combined tagged content (~24k char cap). The extractor creates **separate records per source** for the same entity, enabling cross-source validation.
-
-Key rules:
-- **Strict qualifier matching**: entities must match ALL query qualifiers
-- **Per-source records**: same entity from different sources creates separate records for cross-validation
-- **Numeric parsing**: handles "4.6 stars", "47.2k", "$$$", etc.
-
-### Stage 5: Enrichment & Ranking (pure JS)
-
-**5a. Fuzzy Entity Merging** — per-source records are grouped using token stemming and fuzzy matching (≥70% containment, ≥2 common tokens). Attribute resolution: median for ratings, max for counts, longest string for text.
-
-**5b. Places Cross-Reference** — corrects ratings (prefer Google's value), fills missing address/phone/price from Google Places.
-
-**5c. Quality-Aware Scoring** — auto-detects quality signal columns, weights popularity 2x over ratings, and uses adaptive confidence (no penalty when no entities have quality data).
-
-Fully domain-agnostic — the same code ranks pizza restaurants, startups, and software tools without any domain-specific logic.
-
----
-
-## Known Limitations
+## Known limitations
 
 | Limitation | Impact | Mitigation |
 |---|---|---|
-| ~6k char per-page cap | Deeply-nested page data may be truncated | Sufficient for entity extraction in practice |
-| ~24k char total content cap | Only ~4-5 pages of full content reach the extractor | Chunked extraction (future work) |
-| LLM extraction variance | Same query may produce slightly different results between runs | `temperature=0` for extraction; Places cross-reference for authoritative data |
-| Fuzzy dedup may over-merge | Two entities with similar names could be merged | Conservative thresholds (≥2 common tokens, ≥70% containment) |
-| Vercel function timeout (60s) | Very complex queries with many sources may time out | Pipeline typically completes in 20-35s |
-| No caching | Every query re-runs full pipeline | Redis cache by query hash (future) |
-| Location is manual | User must type their location | Browser Geolocation API (future) |
-
-## Cost & Latency
-
-| Mode | LLM Calls | Serper Credits | Typical Time | Est. Cost |
-|------|-----------|----------------|--------------|-----------|
-| Vercel (Serper + Places) | 2 | 4 search + 1 places | 20-35s | ~$0.02-0.05 |
-| Local (Claude web_search) | 3 | 0 | 30-50s | ~$0.03-0.08 |
+| ~6k char per-page cap | Deeply-nested page data may be truncated | Sufficient in practice for entity extraction |
+| ~24k char total content cap | Only ~4-5 pages of full content reach the extractor | Chunked extraction (future) |
+| LLM extraction variance | Same query may produce slightly different results between runs | `temperature=0`, Places cross-walk for authoritative numerics |
+| Fuzzy dedup can over-merge | Two distinct entities with very similar names could collapse | Conservative thresholds (≥ 2 common tokens, ≥ 70% containment) |
+| Retry adds 15-30s on bad runs | Worst-case latency ~60s when the first pass fails quality gate | Capped at 1 retry; quality gate also fails fast on `no_new_queries` |
+| Single Serper Places call | Only covers the top result(s) per query, not every entity | Per-entity Places lookups would 5× the credits cost |

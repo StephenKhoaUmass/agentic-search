@@ -25,17 +25,31 @@ export default function App() {
     setRunning(true);
 
     try {
-      const res = await fetch('/api/search', {
+      // VITE_API_URL points at the Python LangGraph backend (FastAPI + SSE).
+      // Local dev: http://localhost:8000 (uvicorn default).
+      // Prod:      whatever Railway/Render URL you set in the Vercel env vars.
+      const apiBase = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+
+      const res = await fetch(`${apiBase}/search`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ query, location: location.trim() || undefined }),
       });
 
+      // Pre-stream failures (e.g. Pydantic 422, missing API key 500) return a
+      // normal JSON body, not SSE. Handle that branch first.
       if (!res.ok && !res.headers.get('content-type')?.includes('text/event-stream')) {
         const err = await res.json().catch(() => ({}));
-        throw new Error(err.error || `Server error ${res.status}`);
+        const msg = err.detail || err.error || err.message || `Server error ${res.status}`;
+        throw new Error(typeof msg === 'string' ? msg : JSON.stringify(msg));
       }
 
+      // SSE parsing — manual ReadableStream reader rather than EventSource
+      // because EventSource doesn't support POST + JSON body.
+      // Frame format (server-side, matches api/search.js byte-for-byte):
+      //   event: <name>\n
+      //   data: <json>\n
+      //   \n
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
@@ -60,6 +74,8 @@ export default function App() {
           const parsed = JSON.parse(data);
 
           if (event === 'step') {
+            // Match existing onStep handler: replace-by-id (running→done),
+            // otherwise append.
             setSteps(prev => {
               const idx = prev.findIndex(s => s.id === parsed.id);
               if (idx >= 0) {
