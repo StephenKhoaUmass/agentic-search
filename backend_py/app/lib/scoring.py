@@ -35,7 +35,8 @@ from __future__ import annotations
 import math
 import re
 from typing import Any
-from urllib.parse import urlparse
+
+from .url import domain_from_url
 
 
 # ─── Column-key patterns ────────────────────────────────────────────────────
@@ -92,14 +93,6 @@ def _positive_float(v: Any) -> float | None:
         return n if n > 0 else None
     except (TypeError, ValueError):
         return None
-
-
-def _domain(url: str) -> str:
-    try:
-        h = urlparse(url).hostname or ""
-        return re.sub(r"^(www|m|mobile)\.", "", h)
-    except Exception:
-        return url
 
 
 def _js_round_2(x: float) -> float:
@@ -198,9 +191,14 @@ def score_entities(merged: list[dict], schema: dict) -> list[dict]:
     scored: list[dict] = []
     for e in merged:
         # ── Source diversity bookkeeping ────────────────────────────────────
+        # NOTE: the score formula uses DOMAIN count rather than URL count
+        # (five aussieai.com pages shouldn't outscore one aussieai.com page +
+        # one zenml.io page). URL count is still exposed as `_sources` for
+        # display/debug since it doesn't drive ranking anywhere.
         source_urls: set[str] = e.get("_sourceUrls") or set()
         source_count = len(source_urls)
-        source_domains = {_domain(u) for u in source_urls}
+        source_domains = {domain_from_url(u) for u in source_urls}
+        domain_count = len(source_domains)
         e.pop("_sourceUrls", None)
 
         # Normalize string-tag values into lists (per-row safety net)
@@ -214,24 +212,26 @@ def score_entities(merged: list[dict], schema: dict) -> list[dict]:
             e, rating_cols, popularity_cols, stars_cols,
         )
 
-        # Up to 3 unique domains beyond the first → +0.15 max
-        diversity_bonus = min(max(len(source_domains) - 1, 0), 3) * 0.05
+        # Up to 3 unique domains beyond the first → +0.15 max.
+        # This still rewards reaching more domains beyond the saturation
+        # point of the source-count term (≥ 3 domains).
+        diversity_bonus = min(max(domain_count - 1, 0), 3) * 0.05
 
-        # ── Composite score (mirrors JS exactly) ────────────────────────────
+        # ── Composite score (mirrors JS structure, but with domain_count) ───
         if any_entity_has_quality:
             if has_quality_data:
                 score = (
                     0.15 * completeness
                     + 0.55 * quality_score
-                    + 0.30 * min(source_count / 3, 1)
+                    + 0.30 * min(domain_count / 3, 1)
                 )
             else:
                 # Penalty branch: pool has quality data, this entity doesn't.
                 score = completeness * 0.35
         else:
             # Fallback branch: nobody has quality data; ignore the quality
-            # dimension entirely. Equal weight to completeness and sources.
-            score = 0.5 * completeness + 0.5 * min(source_count / 3, 1)
+            # dimension entirely. Equal weight to completeness and domains.
+            score = 0.5 * completeness + 0.5 * min(domain_count / 3, 1)
         score += diversity_bonus
 
         e["_sources"] = source_count

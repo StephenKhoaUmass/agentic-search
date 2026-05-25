@@ -28,8 +28,23 @@ from __future__ import annotations
 from ...config import get_settings
 from ...lib.places import fetch_serper_places, has_mappable_columns
 from ...lib.search_backends import get_search_backend
+from ...lib.url import cap_per_domain
 from ...streaming.events import emit_done, emit_error, emit_running
 from ..state import PipelineState
+
+
+# Per-domain cap on web sources. Without this, "Top 20 X" listicle sites
+# dominate the source list (one domain × five URLs vs. five domains × one URL
+# would score identically), and downstream extraction ends up with most of
+# its raw entities anchored to the same one or two listicle blog posts.
+#
+# Applied AFTER the backend's URL-level dedup so we keep the top-ranked
+# results per domain rather than whichever happen to come first. Applied
+# BEFORE the Places fetch so the policy is clearly auditable from a
+# top-to-bottom read of this node (the Places call uses the raw user query
+# rather than the source list, so the ordering itself is not load-bearing —
+# but keeping the policy in one chronologically-obvious place is worth it).
+_MAX_URLS_PER_DOMAIN = 3
 
 
 async def search_web_node(state: PipelineState) -> dict:
@@ -52,17 +67,28 @@ async def search_web_node(state: PipelineState) -> dict:
             )
 
         search_results = await backend.search(queries, location=location)
+        raw_count = len(search_results)
+
+        # ── 2b. Per-domain cap (after dedup, before Places) ─────────────────
+        capped, dropped_domains = cap_per_domain(
+            search_results,
+            url_getter=lambda s: s.url,
+            max_per_domain=_MAX_URLS_PER_DOMAIN,
+        )
+
         sources = [
             {"title": s.title, "url": s.url, "snippet": s.snippet}
-            for s in search_results
+            for s in capped
         ]
 
-        # ── 2b. Optional Places reference (Serper-only, sequential) ─────────
+        # ── 2c. Optional Places reference (Serper-only, sequential) ─────────
         # Gated on:
         #   • Serper API key present (Tavily backend has no Places equivalent)
         #   • Schema has at least one column PLACES_COL_MAP can cross-walk
         # Running sequentially after the main search avoids hitting Serper
         # with concurrent /search and /places requests on the free tier.
+        # Uses ``state["query"]`` (raw user input), not ``sources`` — the
+        # per-domain cap above can't lose location signal here.
         places_ref: list[dict] = []
         settings = get_settings()
         if settings.serper_api_key and has_mappable_columns(schema):
@@ -73,8 +99,13 @@ async def search_web_node(state: PipelineState) -> dict:
                 timeout_seconds=settings.http_timeout_seconds,
             )
 
+        cap_note = (
+            f" · capped {sum(dropped_domains.values())} dup-domain URLs"
+            if dropped_domains else ""
+        )
         meta = (
-            f"backend={backend.name}"
+            f"backend={backend.name} · {len(sources)}/{raw_count} sources after cap"
+            + cap_note
             + (f" · {len(places_ref)} Places refs" if places_ref else " · Places: n/a")
         )
         done = await emit_done(

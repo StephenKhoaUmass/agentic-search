@@ -422,6 +422,155 @@ print("  PART 6: OK — B dropped (only 1 filled field), C ranked above A by _sc
 
 
 # ════════════════════════════════════════════════════════════════════════════
+#   PART 7 — fuzzy_match whitespace-collapse fallback (RayServe ↔ Ray Serve)
+# ════════════════════════════════════════════════════════════════════════════
+
+hr("PART 7 — fuzzy_match: whitespace-collapsed equality")
+
+# Direct cases the fallback should catch
+assert fuzzy_match("rayserve", "ray serve"), "RayServe vs Ray Serve"
+assert fuzzy_match("pgvector", "pg vector"), "pgvector vs pg vector"
+assert fuzzy_match("openai", "open ai"),     "openai vs open ai"
+# Substring branch still catches the easy cases unchanged
+assert fuzzy_match("antonios", "antonios pizza")
+# Token-overlap branch still works
+assert fuzzy_match("primo too pizzeria amherst", "primo pizzeria too")
+# No false-positives across genuinely different names
+assert not fuzzy_match("rayserve", "tritonserve"), "Different names: must not match"
+assert not fuzzy_match("pgvector", "milvus"),      "Different names: must not match"
+
+print("  rayserve ↔ ray serve:   match (whitespace fallback)")
+print("  pgvector ↔ pg vector:   match (whitespace fallback)")
+print("  openai   ↔ open ai:     match (whitespace fallback)")
+print("  rayserve ↔ tritonserve: NO match (different names)")
+
+# End-to-end: feed Ray Serve / RayServe as two raw records, confirm they merge
+cols_demo = [
+    {"key": "name", "type": "text"},
+    {"key": "description", "type": "text"},
+    {"key": "source_url", "type": "text"},
+]
+raw_rayserve = [
+    {"name": "Ray Serve",  "description": "Distributed serving framework", "source_url": "https://a.com/1"},
+    {"name": "RayServe",   "description": "Ray's model server",            "source_url": "https://b.com/2"},
+]
+merged_rs = merge_entities(raw_rayserve, cols_demo)
+assert len(merged_rs) == 1, f"Ray Serve + RayServe should merge into 1, got {len(merged_rs)}"
+print(f"  Ray Serve + RayServe merged into 1 canonical entity: '{merged_rs[0]['name']}'")
+print(f"  _sourceUrls captured both: {len(merged_rs[0]['_sourceUrls'])} URLs")
+print("  PART 7: OK — whitespace fallback catches the Ray Serve/RayServe class")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#   PART 8 — Scoring now uses domain count (not URL count)
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Two entities, same completeness, same lack of quality data (fallback
+# branch). Entity A has 3 URLs all on aussieai.com (1 domain). Entity B
+# has 3 URLs across 3 different blogs (3 domains).
+#
+# Before the change: both score 0.5*comp + 0.5*min(3/3, 1) = 0.5 + 0.5 = 1.0.
+# After the change:  A scores 0.5*comp + 0.5*min(1/3, 1) = 0.5 + 0.167 = 0.667;
+#                    B scores 0.5*comp + 0.5*min(3/3, 1) = 0.5 + 0.5   = 1.0.
+# Plus B's diversity bonus (+0.10 for 2 extra domains) pushes it higher still.
+
+hr("PART 8 — Score uses domain count, not URL count")
+
+schema_d = {"columns": [
+    {"key": "name", "type": "text"},
+    {"key": "description", "type": "text"},
+    {"key": "source_url", "type": "text"},
+]}
+
+ent_same_domain = {
+    "name": "FrameworkA",
+    "description": "A description",
+    "source_url": "https://aussieai.com/p1",
+    "_sourceUrls": {
+        "https://aussieai.com/p1",
+        "https://aussieai.com/p2",
+        "https://aussieai.com/p3",
+    },
+}
+ent_multi_domain = {
+    "name": "FrameworkB",
+    "description": "B description",
+    "source_url": "https://blog1.com/x",
+    "_sourceUrls": {
+        "https://blog1.com/x",
+        "https://blog2.com/y",
+        "https://blog3.com/z",
+    },
+}
+
+scored_d = score_entities([dict(ent_same_domain), dict(ent_multi_domain)], schema_d)
+a_out, b_out = scored_d[0], scored_d[1]
+
+# Manual expected for A (1 domain): 0.5*1.0 + 0.5*min(1/3, 1) + diversity 0 = 0.667
+exp_a = 0.5 * 1.0 + 0.5 * (1/3) + 0.0
+# Manual expected for B (3 domains): 0.5*1.0 + 0.5*min(3/3, 1) + diversity 0.10 = 1.10
+exp_b = 0.5 * 1.0 + 0.5 * 1.0     + (2 * 0.05)
+
+print(f"  A (3 URLs, 1 domain):  _score={a_out['_score']:.4f}   expected≈{exp_a:.4f}   _sources={a_out['_sources']}")
+print(f"  B (3 URLs, 3 domains): _score={b_out['_score']:.4f}   expected≈{exp_b:.4f}   _sources={b_out['_sources']}")
+
+# Both retain _sources = 3 URLs (URL count unchanged, only the score formula changed)
+assert a_out["_sources"] == 3
+assert b_out["_sources"] == 3
+# But scores diverge by ~0.43 — the multi-domain entity wins decisively
+assert abs(a_out["_score"] - round(exp_a * 100) / 100) < 0.011
+assert abs(b_out["_score"] - round(exp_b * 100) / 100) < 0.011
+assert b_out["_score"] > a_out["_score"] + 0.30, (
+    "Multi-domain entity should outscore same-domain entity by ≥ 0.30. "
+    f"Got A={a_out['_score']}, B={b_out['_score']}"
+)
+print(f"  Δ = {b_out['_score'] - a_out['_score']:.2f}  ← multi-domain wins decisively")
+print("  PART 8: OK — listicle-monoculture entities no longer ride on URL count")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#   PART 9 — Per-domain source cap (search_web_node policy)
+# ════════════════════════════════════════════════════════════════════════════
+
+hr("PART 9 — cap_per_domain: drops URLs beyond N per host")
+
+from app.lib.url import cap_per_domain, domain_from_url
+
+# Subdomain normalization smoke test
+assert domain_from_url("https://www.aussieai.com/x") == "aussieai.com"
+assert domain_from_url("https://m.yelp.com/biz/y") == "yelp.com"
+print("  domain_from_url normalization (www/m/mobile): OK")
+
+# Simulated Serper output: 16 aussieai pages, 5 medium pages, 2 unique
+fake = [
+    *[{"url": f"https://aussieai.com/p{i}",                  "rank": i} for i in range(16)],
+    *[{"url": f"https://medium.com/@author/post{i}",         "rank": i} for i in range(5)],
+    {"url": "https://github.com/dangkhoasdc/awesome",         "rank": 99},
+    {"url": "https://arxiv.org/abs/1234.5678",                "rank": 100},
+]
+kept, dropped = cap_per_domain(fake, url_getter=lambda x: x["url"], max_per_domain=3)
+
+domains_in_kept = [domain_from_url(x["url"]) for x in kept]
+from collections import Counter as _C
+counts = _C(domains_in_kept)
+print(f"  Input  : 23 URLs across 4 domains "
+      f"(16× aussieai.com, 5× medium.com, 1× github.com, 1× arxiv.org)")
+print(f"  Output : {len(kept)} URLs, distribution: {dict(counts)}")
+print(f"  Dropped: {dropped}")
+
+assert counts["aussieai.com"] == 3, "aussieai.com should be capped to 3"
+assert counts["medium.com"]   == 3, "medium.com should be capped to 3"
+assert counts["github.com"]   == 1, "github.com under cap, kept as-is"
+assert counts["arxiv.org"]    == 1, "arxiv.org under cap, kept as-is"
+assert dropped == {"aussieai.com": 13, "medium.com": 2}, f"unexpected dropped: {dropped}"
+# Order preservation: the FIRST three aussieai URLs are kept (top-ranked)
+kept_aussie_ranks = [x["rank"] for x in kept if "aussieai" in x["url"]]
+assert kept_aussie_ranks == [0, 1, 2], f"Should keep top-ranked: got {kept_aussie_ranks}"
+print(f"  Top-ranked URLs preserved per domain (ranks {kept_aussie_ranks} for aussieai)")
+print("  PART 9: OK — cap drops surplus URLs while keeping top-ranked + under-cap domains intact")
+
+
+# ════════════════════════════════════════════════════════════════════════════
 print("\n" + "═" * 70)
 print("  ALL VERIFICATION GROUPS PASSED")
 print("═" * 70)

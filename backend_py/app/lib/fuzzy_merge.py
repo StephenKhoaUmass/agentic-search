@@ -48,16 +48,23 @@ def stem_token(t: str) -> str:
 def fuzzy_match(a: str, b: str) -> bool:
     """True if ``a`` and ``b`` plausibly refer to the same entity.
 
-    Three-tier strategy:
+    Four-tier strategy (cheapest tests first, short-circuit on hit):
+
       1. Exact match.
       2. Substring (handles ``"Antonio's Pizza" ⊂ "Antonio's Pizza By The Slice"``).
-      3. Stemmed-token overlap: requires ≥ 2 shared tokens AND containment ≥ 0.7
+      3. Whitespace-collapsed equality
+         (handles ``"RayServe" ↔ "Ray Serve"``, ``"pgvector" ↔ "pg vector"``).
+         Strictly an equality test after stripping spaces, so the false-positive
+         risk is negligible vs. a generic edit-distance threshold.
+      4. Stemmed-token overlap: ≥ 2 shared tokens AND containment ≥ 0.7
          where containment = overlap / size of smaller token set.
          Handles ``"Primo Too Pizzeria Amherst" ↔ "Primo Pizzeria Too"``.
     """
     if a == b:
         return True
     if a in b or b in a:
+        return True
+    if a.replace(" ", "") == b.replace(" ", ""):
         return True
 
     tok_a = {stem_token(t) for t in a.split() if len(t) > 1}
