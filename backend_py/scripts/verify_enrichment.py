@@ -571,6 +571,303 @@ print("  PART 9: OK — cap drops surplus URLs while keeping top-ranked + under-
 
 
 # ════════════════════════════════════════════════════════════════════════════
+#   PART 10 — GitHub enrichment (mocked GitHub API)
+# ════════════════════════════════════════════════════════════════════════════
+
+hr("PART 10 — enrich_with_github: gating, direct match, search, non-overwrite")
+
+import asyncio
+import httpx
+
+from app.lib.github_enrich import enrich_with_github
+
+
+def _mock_handler(repo_fixtures: dict, search_fixtures: dict | None = None):
+    """Build a httpx.MockTransport handler from {(owner, repo): payload} maps.
+
+    ``repo_fixtures`` maps slug → dict (or ``"404"`` for not-found / ``"403"``
+    for rate-limit). ``search_fixtures`` maps query → list of repo dicts.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+
+        path = request.url.path
+        if path.startswith("/repos/"):
+            _, _, owner, repo = path.split("/", 3)
+            payload = repo_fixtures.get((owner, repo))
+            if payload == "404":
+                return httpx.Response(404, json={"message": "Not Found"})
+            if payload == "403":
+                return httpx.Response(403, json={"message": "rate limited"})
+            if payload is None:
+                return httpx.Response(404, json={"message": "Not Found"})
+            return httpx.Response(200, json=payload)
+
+        if path == "/search/repositories":
+            q = request.url.params.get("q", "")
+            items = (search_fixtures or {}).get(q, [])
+            return httpx.Response(200, json={"items": items})
+
+        return httpx.Response(404)
+    return handler
+
+
+SCHEMA_WITH_STARS = [
+    {"key": "name", "type": "text"},
+    {"key": "description", "type": "text"},
+    {"key": "source_url", "type": "text"},
+    {"key": "github_stars", "type": "number"},
+    {"key": "license", "type": "text"},
+    {"key": "primary_language", "type": "text"},
+]
+SCHEMA_NO_STARS = [
+    {"key": "name", "type": "text"},
+    {"key": "description", "type": "text"},
+    {"key": "source_url", "type": "text"},
+    {"key": "cuisine", "type": "tags"},
+    {"key": "rating", "type": "number"},
+]
+
+
+# ── Gating 1: schema lacks github_stars → no API calls ───────────────────────
+result = asyncio.run(enrich_with_github(
+    [{"name": "Antonio's Pizza", "source_url": "https://yelp.com/a"}],
+    SCHEMA_NO_STARS,
+    token="ghp_fake_token",
+))
+print(f"  Gating (no github_stars col): {result}")
+assert result == {"skipped_reason": "no_github_stars_column"}
+
+# ── Unauthenticated mode: token=None still runs (degraded rate limit) ──────
+async def run_unauth():
+    transport = httpx.MockTransport(_mock_handler({
+        ("vllm-project", "vllm"): {
+            "stargazers_count": 25400, "license": {"spdx_id": "Apache-2.0"}, "language": "Python",
+        },
+    }))
+    async with httpx.AsyncClient(transport=transport) as ac:
+        return await enrich_with_github(
+            [{"name": "vllm", "source_url": "https://github.com/vllm-project/vllm",
+              "github_stars": None, "license": None, "primary_language": None}],
+            SCHEMA_WITH_STARS,
+            token=None, client=ac,
+        )
+
+result = asyncio.run(run_unauth())
+print(f"  Unauth (no token):           {result}")
+assert result["enriched"] == 1
+assert result["authenticated"] is False, "Stats should expose auth status"
+
+print("  Schema gate + token-optional auth: OK")
+
+
+# ── Direct URL match: source_url is github.com/owner/repo ───────────────────
+fixtures_direct = {
+    ("vllm-project", "vllm"): {
+        "stargazers_count": 25400,
+        "license": {"spdx_id": "Apache-2.0"},
+        "language": "Python",
+    },
+}
+ent_direct = {
+    "name": "vllm",
+    "source_url": "https://github.com/vllm-project/vllm",
+    "github_stars": None, "license": None, "primary_language": None,
+}
+
+async def run_direct():
+    transport = httpx.MockTransport(_mock_handler(fixtures_direct))
+    async with httpx.AsyncClient(transport=transport) as ac:
+        return await enrich_with_github(
+            [ent_direct], SCHEMA_WITH_STARS,
+            token="ghp_fake", client=ac,
+        )
+
+result = asyncio.run(run_direct())
+print(f"\n  Direct URL match: {result}")
+print(f"    {ent_direct}")
+assert result["enriched"] == 1
+assert ent_direct["github_stars"] == 25400
+assert ent_direct["license"] == "Apache-2.0"
+assert ent_direct["primary_language"] == "Python"
+print("  Direct match path: OK")
+
+
+# ── Search fallback: non-github source_url, name matches a real repo ────────
+fixtures_search = {
+    ("ggerganov", "llama.cpp"): {
+        "stargazers_count": 67000,
+        "license": {"spdx_id": "MIT"},
+        "language": "C++",
+    },
+}
+search_fixtures = {
+    "llama.cpp in:name": [
+        {"name": "llama.cpp", "owner": {"login": "ggerganov"},
+         "stargazers_count": 67000, "license": {"spdx_id": "MIT"}, "language": "C++"},
+        {"name": "llama-cpp-python", "owner": {"login": "abetlen"},
+         "stargazers_count": 8500, "license": {"spdx_id": "MIT"}, "language": "Python"},
+    ],
+}
+ent_search = {
+    "name": "llama.cpp",
+    "source_url": "https://aussieai.com/research/frameworks",   # NOT a github URL
+    "github_stars": None, "license": None, "primary_language": None,
+}
+
+async def run_search():
+    transport = httpx.MockTransport(_mock_handler(fixtures_search, search_fixtures))
+    async with httpx.AsyncClient(transport=transport) as ac:
+        return await enrich_with_github(
+            [ent_search], SCHEMA_WITH_STARS,
+            token="ghp_fake", client=ac,
+        )
+
+result = asyncio.run(run_search())
+print(f"\n  Search fallback: {result}")
+print(f"    {ent_search}")
+assert result["enriched"] == 1
+assert ent_search["github_stars"] == 67000   # from the TOP-star exact-name match
+assert ent_search["license"] == "MIT"
+assert ent_search["primary_language"] == "C++"
+print("  Search-by-name path (top-star exact match): OK")
+
+
+# ── Non-overwrite: existing values must not be replaced ─────────────────────
+ent_existing = {
+    "name": "vllm",
+    "source_url": "https://github.com/vllm-project/vllm",
+    "github_stars": 12345,        # already set — should NOT be overwritten
+    "license": "Apache-2.0",      # already set
+    "primary_language": None,     # null — should fill
+}
+
+async def run_nonoverwrite():
+    transport = httpx.MockTransport(_mock_handler({
+        ("vllm-project", "vllm"): {
+            "stargazers_count": 99999,
+            "license": {"spdx_id": "MIT"},
+            "language": "Python",
+        },
+    }))
+    async with httpx.AsyncClient(transport=transport) as ac:
+        return await enrich_with_github(
+            [ent_existing], SCHEMA_WITH_STARS,
+            token="ghp_fake", client=ac,
+        )
+
+asyncio.run(run_nonoverwrite())
+print(f"\n  Non-overwrite test: {ent_existing}")
+assert ent_existing["github_stars"] == 12345,      "Must not overwrite existing stars"
+assert ent_existing["license"] == "Apache-2.0",    "Must not overwrite existing license"
+assert ent_existing["primary_language"] == "Python", "Must fill null primary_language"
+print("  Extractor-provided values preserved; only nulls filled: OK")
+
+
+# ── Search-name strictness: refuses inexact matches ─────────────────────────
+# Entity "TGI" should NOT pick up the popular text-generation-inference repo
+# because the repo's NAME is "text-generation-inference", not "tgi".
+fixtures_inexact_search = {
+    "TGI in:name": [
+        {"name": "text-generation-inference", "owner": {"login": "huggingface"},
+         "stargazers_count": 9500, "license": {"spdx_id": "Apache-2.0"}, "language": "Python"},
+        {"name": "tgi-go",  "owner": {"login": "randomuser"},
+         "stargazers_count": 12, "license": {"spdx_id": "MIT"}, "language": "Go"},
+    ],
+}
+ent_tgi = {
+    "name": "TGI",
+    "source_url": "https://aussieai.com/research/frameworks",
+    "github_stars": None, "license": None, "primary_language": None,
+}
+
+async def run_inexact():
+    transport = httpx.MockTransport(_mock_handler({}, fixtures_inexact_search))
+    async with httpx.AsyncClient(transport=transport) as ac:
+        return await enrich_with_github(
+            [ent_tgi], SCHEMA_WITH_STARS,
+            token="ghp_fake", client=ac,
+        )
+
+result = asyncio.run(run_inexact())
+print(f"\n  Inexact-name guard ('TGI' should NOT pick up text-generation-inference):")
+print(f"    {ent_tgi}    stats={result}")
+assert ent_tgi["github_stars"] is None,  "Inexact match must NOT fill stars"
+assert ent_tgi["license"] is None
+assert ent_tgi["primary_language"] is None
+assert result["errors"] == 1,            "Inexact match must count as an error/skip"
+print("  Conservative name matching prevents false positives: OK")
+
+
+# ── Graceful degradation: rate-limit / 404 — never raises ───────────────────
+ents_mixed = [
+    {"name": "vllm",        "source_url": "https://github.com/vllm-project/vllm",
+     "github_stars": None, "license": None, "primary_language": None},
+    {"name": "made-up-repo","source_url": "https://github.com/nobody/made-up-repo",
+     "github_stars": None, "license": None, "primary_language": None},
+    {"name": "rate-limited","source_url": "https://github.com/limited/rate-limited",
+     "github_stars": None, "license": None, "primary_language": None},
+]
+
+fixtures_mixed = {
+    ("vllm-project", "vllm"): {
+        "stargazers_count": 25400, "license": {"spdx_id": "Apache-2.0"}, "language": "Python",
+    },
+    ("nobody", "made-up-repo"): "404",
+    ("limited", "rate-limited"): "403",
+}
+
+async def run_mixed():
+    transport = httpx.MockTransport(_mock_handler(fixtures_mixed))
+    async with httpx.AsyncClient(transport=transport) as ac:
+        return await enrich_with_github(
+            ents_mixed, SCHEMA_WITH_STARS,
+            token="ghp_fake", client=ac,
+        )
+
+result = asyncio.run(run_mixed())
+print(f"\n  Mixed run (1 hit, 1 404, 1 rate-limit): {result}")
+print(f"    vllm:        stars={ents_mixed[0]['github_stars']}")
+print(f"    made-up:     stars={ents_mixed[1]['github_stars']}  (404 — skipped)")
+print(f"    rate-limit:  stars={ents_mixed[2]['github_stars']}  (403 — skipped)")
+assert result["looked_up"] == 3
+assert result["enriched"]  == 1
+assert result["errors"]    == 2
+assert ents_mixed[0]["github_stars"] == 25400
+assert ents_mixed[1]["github_stars"] is None
+assert ents_mixed[2]["github_stars"] is None
+print("  Per-entity HTTP errors are non-fatal; partial enrichment succeeds: OK")
+
+
+# ── NOASSERTION license guard ───────────────────────────────────────────────
+ent_noassert = {
+    "name": "unlicensed", "source_url": "https://github.com/x/unlicensed",
+    "github_stars": None, "license": None, "primary_language": None,
+}
+
+async def run_noassert():
+    transport = httpx.MockTransport(_mock_handler({
+        ("x", "unlicensed"): {
+            "stargazers_count": 42, "license": {"spdx_id": "NOASSERTION"}, "language": "Go",
+        },
+    }))
+    async with httpx.AsyncClient(transport=transport) as ac:
+        return await enrich_with_github(
+            [ent_noassert], SCHEMA_WITH_STARS,
+            token="ghp_fake", client=ac,
+        )
+
+asyncio.run(run_noassert())
+print(f"\n  NOASSERTION license guard: {ent_noassert}")
+assert ent_noassert["github_stars"] == 42
+assert ent_noassert["license"] is None,  "NOASSERTION should NOT be propagated as a license"
+assert ent_noassert["primary_language"] == "Go"
+print("  GitHub's 'NOASSERTION' (no LICENSE file) skipped, stars/lang still filled: OK")
+
+
+print("  PART 10: OK — GitHub enrichment behaves correctly across all paths")
+
+
+# ════════════════════════════════════════════════════════════════════════════
 print("\n" + "═" * 70)
 print("  ALL VERIFICATION GROUPS PASSED")
 print("═" * 70)
