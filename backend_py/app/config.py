@@ -38,6 +38,11 @@ class Settings:
     tavily_api_key: str | None
     github_token: str | None
 
+    # ── Search backend selection ────────────────────────────────────────────
+    # Optional override ("serper" | "tavily"). When None, the factory in
+    # ``app/lib/search_backends/__init__.py`` auto-selects (Tavily-first).
+    search_backend: str | None = None
+
     # ── LLM ─────────────────────────────────────────────────────────────────
     claude_model: str = "claude-sonnet-4-20250514"
 
@@ -77,6 +82,7 @@ def get_settings() -> Settings:
         serper_api_key=_env("SERPER_API_KEY"),
         tavily_api_key=_env("TAVILY_API_KEY"),
         github_token=_env("GITHUB_PERSONAL_ACCESS_TOKEN") or _env("GITHUB_TOKEN"),
+        search_backend=_env("SEARCH_BACKEND"),
         claude_model=_env("CLAUDE_MODEL") or "claude-sonnet-4-20250514",
     )
     return _settings

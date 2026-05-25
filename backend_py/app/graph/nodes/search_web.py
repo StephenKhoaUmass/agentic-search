@@ -5,22 +5,23 @@ authoritative Google Places data for entity cross-referencing during
 enrichment.
 
 Backend selection is pluggable via
-``app.lib.search_backends.get_search_backend()``. Today only the
-:class:`SerperBackend` is wired up; the abstraction is designed so adding a
-Tavily MCP backend is a one-file change:
+``app.lib.search_backends.get_search_backend()``. Two backends are wired:
 
-    1. Implement ``SearchBackend`` in
-       ``app/lib/search_backends/tavily_mcp.py``.
-    2. Append a branch to ``get_search_backend()`` that returns it when
-       ``TAVILY_API_KEY`` is set.
+    * :class:`SerperBackend` — direct REST against ``google.serper.dev``.
+    * :class:`TavilyMCPBackend` — official Tavily hosted MCP server, via
+      the Model Context Protocol over Streamable HTTP using the ``mcp``
+      Python SDK.
 
-No changes to this node, the state, or any other pipeline stage are needed.
+Default priority is Tavily → Serper when both keys are set. Override
+with the ``SEARCH_BACKEND`` env var.
 
 Places reference is intentionally NOT part of the SearchBackend abstraction:
 Google Places is Serper-specific, runs sequentially after the main search
 to avoid concurrent rate-limit hits, and is gated on whether the schema
 actually has columns the PLACES_COL_MAP can cross-walk. For non-local
-queries (e.g. "open source vector databases") this step is a no-op.
+queries (e.g. "open source vector databases") this step is a no-op. The
+Places call always uses Serper regardless of which backend drives the
+main search — Tavily has no local-business equivalent today.
 """
 
 from __future__ import annotations
@@ -62,8 +63,8 @@ async def search_web_node(state: PipelineState) -> dict:
         backend = get_search_backend()
         if backend is None:
             raise RuntimeError(
-                "No web search backend configured. Set SERPER_API_KEY in "
-                "backend_py/.env (Tavily MCP backend not yet wired)."
+                "No web search backend configured. Set TAVILY_API_KEY (Tavily "
+                "MCP) or SERPER_API_KEY (Serper.dev) in backend_py/.env."
             )
 
         search_results = await backend.search(queries, location=location)

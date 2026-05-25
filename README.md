@@ -6,7 +6,7 @@ A multi-stage LLM agent pipeline that takes a natural-language topic query and p
 Query: "AI startups in healthcare"
   ↓
 [1] Schema Planner   →  domain-appropriate columns + 4 diverse search queries
-[2] Web Search       →  Serper.dev (or Tavily MCP, planned) → ~15 sources + Google Places refs
+[2] Web Search       →  Tavily MCP (or Serper.dev) → ~15 sources + Google Places refs
 [3] Page Scraper     →  Jina Reader → markdown (no LLM)
 [4] Entity Extractor →  Claude @ temperature=0, strict qualifier matching, per-source records
 [5] Enricher         →  fuzzy merge → Places cross-walk → GitHub stats → adaptive quality scoring → filter
@@ -28,8 +28,8 @@ A LangGraph quality-gate node after extraction can route back into search with r
 
 You'll also need API keys for:
 - **Anthropic** (required) — used for the planner, extractor, and reformulator
-- **Serper.dev** (optional but strongly recommended) — `https://serper.dev`, free tier is 2,500 queries/month
-- **Tavily** (optional) — used via MCP when wired up; falls back to Serper today
+- **Tavily** (recommended) — `https://app.tavily.com`, used via the official hosted MCP server. Tavily's `content` blobs are pre-processed for AI consumption, so extraction sees tighter, less listicle-heavy results than raw Google. Set `TAVILY_API_KEY` to enable.
+- **Serper.dev** (recommended) — `https://serper.dev`, used as the search backend when `TAVILY_API_KEY` is missing, **and** unconditionally for the Google Places cross-walk on local-business queries (Tavily has no Places equivalent). Free tier is 2,500 queries/month.
 - **GitHub PAT** (optional but recommended for open-source queries) — used to fill `github_stars`, `license`, and `primary_language` for entities that resolve to a `github.com` repo. Without a token, enrichment still runs but is throttled to GitHub's 60 req/hr unauthenticated limit, which means most lookups will rate-limit out after the first query. With a token (a read-only PAT works fine — no scopes needed), you get 5,000 / 30-search per hour. Create one at <https://github.com/settings/tokens?type=beta>
 
 ---
@@ -114,12 +114,13 @@ The Python backend is **not** deployable to Vercel — its LangGraph runner is a
 #   2. Root Directory:  backend_py
 #   3. Start Command:   uvicorn app.main:app --host 0.0.0.0 --port $PORT
 #   4. Environment variables (Variables tab):
-#        ANTHROPIC_API_KEY = sk-ant-...           (required)
-#        SERPER_API_KEY    = ...                  (recommended)
-#        TAVILY_API_KEY    = ...                  (optional)
-#        GITHUB_PERSONAL_ACCESS_TOKEN = ...       (optional)
-#        ALLOWED_ORIGINS   = https://<your-frontend>.vercel.app
-#        CLAUDE_MODEL      = claude-sonnet-4-20250514   (optional override)
+#        ANTHROPIC_API_KEY            = sk-ant-...           (required)
+#        TAVILY_API_KEY               = tvly-...             (recommended)
+#        SERPER_API_KEY               = ...                  (recommended — drives Places too)
+#        GITHUB_PERSONAL_ACCESS_TOKEN = ghp_...               (optional, lifts GitHub rate limit)
+#        SEARCH_BACKEND               = tavily | serper      (optional override; auto-selects Tavily-first)
+#        ALLOWED_ORIGINS              = https://<your-frontend>.vercel.app
+#        CLAUDE_MODEL                 = claude-sonnet-4-20250514   (optional override)
 #   5. Generate Domain → copy the *.up.railway.app URL
 ```
 
@@ -132,6 +133,8 @@ Then set `VITE_API_URL` to that URL in your Vercel project's environment variabl
 ## Architecture
 
 The pipeline is built on **LangGraph** — each of the 5 stages above is one node in a typed `StateGraph[PipelineState]`. After extraction, an `evaluate_quality` node decides `pass | retry | fail` based on source count, entity count, and the fraction of low-confidence results; on `retry` a `reformulate_queries` node asks Claude for 4 fresh search queries (deduped against prior attempts) and the graph loops back to `search_web`. Retry budget is capped at 2 iterations total to bound latency and cost.
+
+Web search is backed by **Tavily MCP** (default) or **Serper.dev**. The Tavily backend speaks the Model Context Protocol over Streamable HTTP via the official `mcp` Python SDK — no LLM-in-the-loop, just programmatic `tavily_search` tool calls reusing one MCP session across all four queries. Both backends satisfy the same `SearchBackend` protocol (`async def search(queries, location, max_results) -> list[SearchResult]`), so the node, the per-domain cap, and every downstream stage stay backend-agnostic. Priority is Tavily-first when both keys are set; override with `SEARCH_BACKEND=serper` or `SEARCH_BACKEND=tavily`. The Google Places cross-walk always uses Serper since Tavily has no local-business equivalent.
 
 The enrichment stage runs three pure post-processing primitives in order — fuzzy entity merge, Google Places cross-walk (for local-business queries that bring back authoritative `places_ref` rows), and **GitHub stats enrichment** (for open-source queries whose schema includes a `github_stars` column). The GitHub layer resolves each entity to a `github.com/{owner}/{repo}` slug — first by checking the entity's `source_url` / `_sourceUrls`, then by falling back to a name-exact `GET /search/repositories` with `sort=stars` — and fills `github_stars` / `license` / `primary_language` from the resulting REST response. The module is shaped so a swap to the official `github-mcp-server` is a one-function change at the boundary; see `app/lib/github_enrich.py`. All three primitives run **before** quality scoring so newly-filled fields participate in the adaptive composite score.
 
@@ -151,7 +154,7 @@ agentic-search/
 │   │   │   └── nodes/         ← one async function per stage
 │   │   ├── lib/
 │   │   │   ├── claude.py      ← Anthropic async wrapper (per-call MCP support)
-│   │   │   ├── search_backends/  ← pluggable Serper / Tavily-MCP backends
+│   │   │   ├── search_backends/  ← SerperBackend + TavilyMCPBackend (mcp SDK)
 │   │   │   ├── places.py      ← Serper Places API + PLACES_COL_MAP cross-walk
 │   │   │   ├── github_enrich.py ← GitHub REST enrichment (stars/license/lang)
 │   │   │   ├── jina.py        ← Jina Reader async fetch
