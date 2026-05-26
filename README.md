@@ -1,12 +1,14 @@
 # Agentic Search — Entity Discovery Engine
 
+**Live demo:** [agentic-search-three.vercel.app](https://agentic-search-three.vercel.app)
+
 A multi-stage LLM agent pipeline that takes a natural-language topic query and produces a structured, source-traceable table of discovered entities.
 
 ```
 Query: "AI startups in healthcare"
   ↓
 [1] Schema Planner   →  domain-appropriate columns + 4 diverse search queries
-[2] Web Search       →  Tavily MCP (or Serper.dev) → ~15 sources + Google Places refs
+[2] Web Search       →  Hybrid: Tavily MCP + Serper in parallel → interleaved union → ~15 sources + Google Places refs
 [3] Page Scraper     →  Jina Reader → markdown (no LLM)
 [4] Entity Extractor →  Claude @ temperature=0, strict qualifier matching, per-source records
 [5] Enricher         →  fuzzy merge → Places cross-walk → GitHub stats → adaptive quality scoring → filter
@@ -134,7 +136,7 @@ Then set `VITE_API_URL` to that URL in your Vercel project's environment variabl
 
 The pipeline is built on **LangGraph** — each of the 5 stages above is one node in a typed `StateGraph[PipelineState]`. After extraction, an `evaluate_quality` node decides `pass | retry | fail` based on source count, entity count, and the fraction of low-confidence results; on `retry` a `reformulate_queries` node asks Claude for 4 fresh search queries (deduped against prior attempts) and the graph loops back to `search_web`. Retry budget is capped at 2 iterations total to bound latency and cost.
 
-Web search is backed by **Tavily MCP** (default) or **Serper.dev**. The Tavily backend speaks the Model Context Protocol over Streamable HTTP via the official `mcp` Python SDK — no LLM-in-the-loop, just programmatic `tavily_search` tool calls reusing one MCP session across all four queries. Both backends satisfy the same `SearchBackend` protocol (`async def search(queries, location, max_results) -> list[SearchResult]`), so the node, the per-domain cap, and every downstream stage stay backend-agnostic. Priority is Tavily-first when both keys are set; override with `SEARCH_BACKEND=serper` or `SEARCH_BACKEND=tavily`. The Google Places cross-walk always uses Serper since Tavily has no local-business equivalent.
+Web search uses a **hybrid backend** (default when both keys are set) that fires Tavily MCP and Serper concurrently via `asyncio.gather`, then interleaves the two ranked lists round-robin before the per-domain cap is applied. The two backends are empirically complementary: Tavily surfaces focused blog and arXiv content, Serper indexes GitHub awesome-lists and community-curated directories. Unioning them recovered entities missed by either backend alone (e.g. pgvector surfaced by Serper's awesome-list results) while Tavily's higher-quality content reduced listicle noise — reducing irrelevant results by ~75% vs the Serper-only baseline across a 3-query benchmark. Wall-clock latency is `max(tavily, serper)` rather than the sum, so there is no real cost to running both. Both backends satisfy the same `SearchBackend` protocol (`async def search(queries, location, max_results) -> list[SearchResult]`), so the node and every downstream stage stay backend-agnostic. Override with `SEARCH_BACKEND=tavily|serper|hybrid`. The Google Places cross-walk always uses Serper since Tavily has no local-business equivalent.
 
 The enrichment stage runs three pure post-processing primitives in order — fuzzy entity merge, Google Places cross-walk (for local-business queries that bring back authoritative `places_ref` rows), and **GitHub stats enrichment** (for open-source queries whose schema includes a `github_stars` column). The GitHub layer resolves each entity to a `github.com/{owner}/{repo}` slug — first by checking the entity's `source_url` / `_sourceUrls`, then by falling back to a name-exact `GET /search/repositories` with `sort=stars` — and fills `github_stars` / `license` / `primary_language` from the resulting REST response. The module is shaped so a swap to the official `github-mcp-server` is a one-function change at the boundary; see `app/lib/github_enrich.py`. All three primitives run **before** quality scoring so newly-filled fields participate in the adaptive composite score.
 
@@ -154,7 +156,7 @@ agentic-search/
 │   │   │   └── nodes/         ← one async function per stage
 │   │   ├── lib/
 │   │   │   ├── claude.py      ← Anthropic async wrapper (per-call MCP support)
-│   │   │   ├── search_backends/  ← SerperBackend + TavilyMCPBackend (mcp SDK)
+│   │   │   ├── search_backends/  ← SerperBackend + TavilyMCPBackend + HybridBackend
 │   │   │   ├── places.py      ← Serper Places API + PLACES_COL_MAP cross-walk
 │   │   │   ├── github_enrich.py ← GitHub REST enrichment (stars/license/lang)
 │   │   │   ├── jina.py        ← Jina Reader async fetch
